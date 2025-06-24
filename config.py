@@ -15,8 +15,8 @@ class Settings():
     BOT_TOKEN = os.getenv("BOT_TOKEN", "1599848664:AAHPUpWqNCMpWub_ir2RgmlYcRsebT4WQvo")
     
     # Configuration de la base de données
-    DATABASE_URI = environ.get('DATABASE_URI', "mongodb+srv://erenyeagermikasa84:pkbOXb3ulzi9cEFd@cluster0.ingt8mt.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
-    DATABASE_NAME = environ.get('DATABASE_NAME', "Cluster0")
+    DATABASE_URI = os.getenv('DATABASE_URI', "mongodb+srv://erenyeagermikasa84:pkbOXb3ulzi9cEFd@cluster0.ingt8mt.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+    DATABASE_NAME = os.getenv('DATABASE_NAME', "Cluster0")
         
     # Répertoires temporaires et de téléchargement
     TEMP_DIR = os.getenv("TEMP_DIR", "temp/")
