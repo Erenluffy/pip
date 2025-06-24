@@ -705,12 +705,21 @@ async def set_media_type(client: Client, message: Message):
 async def toggle_auto_rename(client: Client, message: Message):
     """Toggle auto-rename feature on/off"""
     user_id = message.from_user.id
-    current = await hyoshcoder.users.find_one(
-        {"_id": user_id},
-        {"settings.auto_rename": 1}
-    )
+    args = message.text.split()
     
-    new_setting = not current.get("settings", {}).get("auto_rename", False) if current else True
+    if len(args) > 1:
+        if args[1].lower() in ["on", "yes", "enable"]:
+            new_setting = True
+        elif args[1].lower() in ["off", "no", "disable"]:
+            new_setting = False
+        else:
+            return await message.reply_text("Invalid argument! Use /autorename on or /autorename off")
+    else:
+        current = await hyoshcoder.users.find_one(
+            {"_id": user_id},
+            {"settings.auto_rename": 1}
+        )
+        new_setting = not current.get("settings", {}).get("auto_rename", False) if current else True
     
     await hyoshcoder.users.update_one(
         {"_id": user_id},
@@ -719,6 +728,7 @@ async def toggle_auto_rename(client: Client, message: Message):
     )
     
     await message.reply_text(f"🔄 Auto-rename {'enabled' if new_setting else 'disabled'}!")
+    
 
 @Client.on_message(filters.command(["replace", "remove"]))
 async def handle_replace_remove(client: Client, message: Message):
@@ -872,7 +882,9 @@ async def remove_duplicates(client: Client, message: Message):
     seen_hashes = set()
     
     for file in files:
-        file_hash = hash((file["file_name"], file["size"]))
+        # Safely get file size with default to 0 if not available
+        file_size = file.get("size", 0)
+        file_hash = hash((file["file_name"], file_size))
         if file_hash not in seen_hashes:
             seen_hashes.add(file_hash)
             unique_files.append(file)
