@@ -1,42 +1,29 @@
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified, BadRequest
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from PIL import Image
 from datetime import datetime, timedelta
 import os
 import time
 import re
 import pytz
+
 import asyncio
 import random
 import shutil
+from pyrogram.types import InputMediaPhoto
 import uuid
 import logging
 from pyrogram.enums import ParseMode, ChatAction
 import json
-from typing import Optional, Tuple, Dict, List, Set, Union
-from urllib.parse import urlparse
-from difflib import SequenceMatcher
-from html import escape as html_escape
-
+from typing import Optional, Tuple, Dict, List, Set
 # Database imports
 from database.data import hyoshcoder
 from config import settings
 from helpers.utils import progress_for_pyrogram, humanbytes, convert, extract_episode, extract_quality, extract_season
-
-logger = logging.getLogger(__name__)
-
-# Global variables to manage operations
-user_file_queues = {}  # Tracks all files in queue per user
-user_semaphores = {}   # Semaphores per user for concurrency control
-renaming_operations = {}  # Tracks currently processing files
-user_batch_trackers = {}  # Track batch operations per user
-sequential_operations = {}  # For sequential mode
-active_sequences = {}  # For sequence handling
-sequence_message_ids = {}  # Track sequence messages
-cancel_operations = {}  # Track cancel requests
-processed_files = set()  # Track processed files to prevent duplicate point deductions
-file_processing_counters = {}  # Track file processing counts
+from pyrogram.errors import MessageNotModified, BadRequest
+import html
+from html import escape as html_escape
 
 def escape_markdown(text: str) -> str:
     """Custom Markdown escaper for Telegram"""
@@ -46,6 +33,22 @@ def escape_markdown(text: str) -> str:
 def escape_html(text: str) -> str:
     """Escape text for HTML parse mode"""
     return html_escape(text, quote=False)
+    
+logger = logging.getLogger(__name__)
+
+# Global variables to manage operations
+user_file_queues = {}  # Tracks all files in queue per user
+user_semaphores = {}   # Semaphores per user for concurrency control
+renaming_operations = {}  # Tracks currently processing files
+user_batch_trackers = {}  # Track batch operations per user
+sequential_operations = {}  # For sequential mode
+active_sequences = {}  # For sequence handling
+cancel_operations = {}  # Track cancel requests
+processed_files = set()  # Track processed files to prevent duplicate point deductions
+
+# Sequence handling variables
+active_sequences: Dict[int, List[Dict[str, str]]] = {}
+sequence_message_ids: Dict[int, List[int]] = {}
 
 def sanitize_metadata(metadata_text: str) -> str:
     """Sanitize metadata text to be FFmpeg-safe"""
@@ -123,11 +126,11 @@ def sanitize_filename(filename: str) -> str:
     return sanitized.encode('ascii', 'ignore').decode('ascii').strip()
 
 async def get_user_semaphore(user_id: int) -> asyncio.Semaphore:
-    """Get or create semaphore for user"""
+    """Get or create semaphore for user with 3 concurrent slots"""
     if user_id not in user_semaphores:
-        user_semaphores[user_id] = asyncio.Semaphore(2)
+        user_semaphores[user_id] = asyncio.Semaphore(3)  # Increased from 2 to 3
     return user_semaphores[user_id]
-
+    
 async def get_stream_indexes(input_path: str):
     try:
         probe = await asyncio.create_subprocess_exec(
@@ -406,279 +409,78 @@ async def get_user_rank(user_id: int, time_range: str = "all") -> Tuple[Optional
         logger.error(f"Error getting user rank: {e}")
         return None, 0
 
-async def send_completion_message(client: Client, user_id: int, start_time: float, file_count: int, points_used: int):
-    """Send the unified completion message for batch operations"""
-    try:
-        # Check if operation was canceled
-        if user_id in cancel_operations and cancel_operations[user_id]:
-            del cancel_operations[user_id]
-            return await client.send_message(user_id, "❌ Batch processing was canceled!")
-        
-        user_rank, total_renames = await get_user_rank(user_id)
-        user_points = await hyoshcoder.get_points(user_id)
-        
-        time_taken = time.time() - start_time
-        mins, secs = divmod(int(time_taken), 60)
-        avg_time = time_taken / file_count if file_count > 0 else 0
-        avg_mins, avg_secs = divmod(int(avg_time), 60)
-        
-        completion_msg = (
-            f"❐ Batch Rename Completed\n\n"
-            f"⌬ Total Files Processed: {file_count}\n"
-            f"⌬ Total Points Used: {points_used}\n"
-            f"⌬ Points Remaining: {user_points}\n"
-            f"⌬ Total Time Taken: {mins}m {secs}s\n"
-            f"⌬ Average Time Per File: {avg_mins}m {avg_secs}s\n"
-            f"⌬ Your Total Renames: {total_renames}\n"
-            f"⌬ Global Rank: #{user_rank if user_rank else 'N/A'}"
-        )
-        
-        await client.send_message(user_id, completion_msg)
-    except Exception as e:
-        logger.error(f"Error sending completion message: {e}")
-        await client.send_message(user_id, "✅ Batch processing completed successfully!")
-
-async def send_single_success_message(client: Client, message: Message, file_name: str, renamed_file_name: str, 
-                                    start_time: float, rename_cost: int, metadata_added: bool):
-    """Send success message for single file operations"""
+async def send_success_message(client: Client, message: Message, file_info: dict, renamed_file_name: str, 
+                             start_time: float, points_used: int, metadata_added: bool, is_batch: bool = False):
+    """Unified success message handler for both single and batch operations"""
     try:
         # Check if operation was canceled
         if message.from_user.id in cancel_operations and cancel_operations[message.from_user.id]:
-            del cancel_operations[message.from_user.id]
             return await message.reply_text("❌ Processing was canceled!")
         
         elapsed_seconds = time.time() - start_time
         minutes, seconds = divmod(int(elapsed_seconds), 60)
+        time_taken_str = f"{minutes}m {seconds}s" if minutes > 0 else f"{seconds}s"
         
-        if minutes > 0:
-            time_taken_str = f"{minutes}m {seconds}s"
+        remaining_points = (await hyoshcoder.get_points(message.from_user.id)) - points_used
+        
+        if is_batch:
+            # Batch success message
+            success_msg = (
+                f"✅ 𝗕𝗮𝘁𝗰𝗵 𝗥𝗲𝗻𝗮𝗺𝗲 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲𝗱\n\n"
+                f"▫️ 𝗧𝗶𝗺𝗲 𝗧𝗮𝗸𝗲𝗻: {time_taken_str}\n"
+                f"▫️ 𝗣𝗼𝗶𝗻𝘁𝘀 𝗨𝘀𝗲𝗱: {points_used}\n"
+                f"▫️ 𝗥𝗲𝗺𝗮𝗶𝗻𝗶𝗻𝗴 𝗣𝗼𝗶𝗻𝘁𝘀: {remaining_points}\n"
+                f"▫️ 𝗠𝗲𝘁𝗮𝗱𝗮𝘁𝗮 𝗔𝗱𝗱𝗲𝗱: {'Yes' if metadata_added else 'No'}"
+            )
         else:
-            time_taken_str = f"{seconds}s"
-
-        remaining_points = (await hyoshcoder.get_points(message.from_user.id)) - rename_cost
-        success_msg = (
-            f"✅ 𝗙𝗶𝗹𝗲 𝗥𝗲𝗻𝗮𝗺𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!\n\n"
-            f"➲ 𝗢𝗿𝗶𝗴𝗶𝗻𝗮𝗹: `{file_name}`\n"
-            f"➲ 𝗥𝗲𝗻𝗮𝗺𝗲𝗱: `{renamed_file_name}`\n"
-            f"➲ 𝗧𝗶𝗺𝗲 𝗧𝗮𝗸𝗲𝗻: {time_taken_str}\n"
-            f"➲ 𝗠𝗲𝘁𝗮𝗱𝗮𝘁𝗮 𝗔𝗱𝗱𝗲𝗱: {'𝗬𝗲𝘀' if metadata_added else '𝗡𝗼'}\n"
-            f"➲ 𝗣𝗼𝗶𝗻𝘁𝘀 𝗨𝘀𝗲𝗱: {rename_cost}\n"
-            f"➲ 𝗥𝗲𝗺𝗮𝗶𝗻𝗶𝗻𝗴 𝗣𝗼𝗶𝗻𝘁𝘀: {remaining_points}"
-        )
-
+            # Single file success message
+            success_msg = (
+                f"✅ 𝗙𝗶𝗹𝗲 𝗥𝗲𝗻𝗮𝗺𝗲𝗱 𝗦𝘂𝗰𝗰𝗲𝘀𝘀𝗳𝘂𝗹𝗹𝘆!\n\n"
+                f"➲ 𝗢𝗿𝗶𝗴𝗶𝗻𝗮𝗹: `{file_info['file_name']}`\n"
+                f"➲ 𝗥𝗲𝗻𝗮𝗺𝗲𝗱: `{renamed_file_name}`\n"
+                f"➲ 𝗧𝗶𝗺𝗲 𝗧𝗮𝗸𝗲𝗻: {time_taken_str}\n"
+                f"➲ 𝗠𝗲𝘁𝗮𝗱𝗮𝘁𝗮 𝗔𝗱𝗱𝗲𝗱: {'Yes' if metadata_added else 'No'}\n"
+                f"➲ 𝗣𝗼𝗶𝗻𝘁𝘀 𝗨𝘀𝗲𝗱: {points_used}\n"
+                f"➲ 𝗥𝗲𝗺𝗮𝗶𝗻𝗶𝗻𝗴 𝗣𝗼𝗶𝗻𝘁𝘀: {remaining_points}"
+            )
+        
         await message.reply_text(success_msg)
     except Exception as e:
         logger.error(f"Error sending success message: {e}")
-        await message.reply_text("✅ File processed successfully!")
-
-async def apply_cleaning_rules(user_id: int, filename: str) -> str:
-    """Apply all cleaning rules to a filename"""
-    user_data = await hyoshcoder.users.find_one(
-        {"_id": user_id},
-        {"replace_rules": 1, "settings.auto_rename": 1}
-    )
+        await message.reply_text("✅ Operation completed successfully!")
+@Client.on_message(filters.command("cancel"))
+async def cancel_processing(client: Client, message: Message):
+    """Cancel current processing operations"""
+    user_id = message.from_user.id
+    cancel_operations[user_id] = True
     
-    cleaned = filename
+    # Clean up any ongoing operations
+    if user_id in user_batch_trackers:
+        del user_batch_trackers[user_id]
+    if user_id in file_processing_counters:
+        del file_processing_counters[user_id]
+    if user_id in sequential_operations:
+        sequential_operations[user_id]["files"] = []
     
-    # Apply replacement/removal rules
-    if user_data and "replace_rules" in user_data:
-        for rule in user_data["replace_rules"]:
-            if "new" in rule:  # Replacement
-                cleaned = cleaned.replace(rule["old"], rule["new"])
-            else:  # Removal
-                cleaned = cleaned.replace(rule["old"], "")
-    
-    # Apply auto-rename if enabled
-    if user_data.get("settings", {}).get("auto_rename", False):
-        cleaned = await generate_auto_name(cleaned)
-    
-    # Final cleanup
-    cleaned = re.sub(r'[\._]+', ' ', cleaned)  # Convert separators to spaces
-    cleaned = re.sub(r'\s+', ' ', cleaned).strip()  # Remove extra spaces
-    
-    return cleaned
+    await message.reply_text("🛑 Cancel request received. Current operations will be stopped after completing current file.")
 
-async def generate_auto_name(filename: str) -> str:
-    """Generate automatic name based on filename patterns"""
-    try:
-        # Extract season and episode
-        season = await extract_season(filename)
-        episode = await extract_episode(filename)
-        quality = await extract_quality(filename)
-        
-        # Build new name
-        parts = []
-        if season:
-            parts.append(f"S{season.zfill(2)}")
-        if episode:
-            parts.append(f"E{episode.zfill(2)}")
-        if quality:
-            parts.append(quality)
-            
-        if parts:
-            return " ".join(parts)
-        return filename
-    except Exception as e:
-        logger.error(f"Error in auto name generation: {e}")
-        return filename
-
-async def parse_message_link(client: Client, link: str) -> Optional[int]:
-    """Extract message ID from Telegram message link"""
-    try:
-        parsed = urlparse(link)
-        if not parsed.path:
-            return None
-        
-        path_parts = parsed.path.strip("/").split("/")
-        if len(path_parts) < 2:
-            return None
-        
-        # Handle both public and private links
-        if path_parts[0] == "c":
-            # Private channel link (e.g., /c/12345/678)
-            if not path_parts[1].isdigit():
-                return None
-            return int(path_parts[2]) if len(path_parts) > 2 and path_parts[2].isdigit() else None
-        else:
-            # Public link (e.g., /username/12345)
-            return int(path_parts[1]) if path_parts[1].isdigit() else None
-    except Exception as e:
-        logger.error(f"Link parsing error: {e}")
-        return None
-
-async def get_file_hash(client: Client, file_info: dict) -> str:
-    """Generate unique hash for file detection"""
-    try:
-        # For files we have access to
-        if "file_id" in file_info:
-            file = await client.download_media(file_info["file_id"], in_memory=True)
-            return str(hash(file.getbuffer()))
-        
-        # Fallback to name + size
-        return str(hash((file_info.get("file_name", ""), file_info.get("size", 0))))
-    except Exception as e:
-        logger.error(f"Hash generation error: {e}")
-        return str(hash((file_info.get("file_name", ""), file_info.get("size", 0))))
-
-async def process_file_with_features(
-    client: Client,
-    message: Message,
-    file_info: dict,
-    user_data: dict
-) -> bool:
-    """Enhanced file processor with all features"""
+# SEQUENCE HANDLERS
+@Client.on_message(filters.command(["ssequence", "startsequence"]))
+async def start_sequence(client: Client, message: Message):
+    """Start a file sequence collection"""
     user_id = message.from_user.id
     
-    # 1. Apply cleaning rules
-    original_name = file_info["file_name"]
-    cleaned_name = await apply_cleaning_rules(user_id, original_name)
+    if settings.ADMIN_MODE and user_id not in settings.ADMINS:
+        return await message.reply_text("**Admin mode is active - Only admins can use sequences!**")
+        
+    if user_id in active_sequences:
+        return await message.reply_text("**A sequence is already active! Use /esequence to end it.**")
     
-    # 2. Download file (with retry logic)
-    file_path = await download_file_with_retry(client, message, file_info)
-    if not file_path:
-        return False
+    active_sequences[user_id] = []
+    sequence_message_ids[user_id] = []
     
-    # 3. Add metadata if enabled
-    metadata_added = False
-    if user_data.get("metadata_enabled", False):
-        metadata_text = user_data.get("metadata_template", "")
-        if metadata_text:
-            metadata_path = f"{file_path}_meta"
-            success, _ = await add_comprehensive_metadata(file_path, metadata_path, metadata_text)
-            if success:
-                file_path = metadata_path
-                metadata_added = True
-    
-    # 4. Handle dump channel
-    dump_success = False
-    dump_channel = await hyoshcoder.get_user_channel(user_id)
-    if dump_channel:
-        dump_success = await send_to_dump_channel(
-            client,
-            user_id,
-            file_path,
-            caption=f"From channel rename: {cleaned_name}",
-            thumb_path=await get_thumbnail_path(client, message)
-        )
-    
-    # 5. Send to user if dump failed or not configured
-    if not dump_success:
-        await send_file_to_user(client, message, file_path, cleaned_name)
-    
-    # 6. Track operation
-    rename_cost = settings.RENAME_COST
-    await track_rename_operation(user_id, original_name, cleaned_name, rename_cost)
-    
-    # 7. Cleanup
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    
-    return True
-
-async def download_file_with_retry(client: Client, message: Message, file_info: dict, max_retries=3) -> Optional[str]:
-    """Download file with retry logic"""
-    temp_path = f"temp_{file_info['file_id']}"
-    
-    for attempt in range(max_retries):
-        try:
-            return await client.download_media(
-                message,
-                file_name=temp_path,
-                progress=progress_for_pyrogram,
-                progress_args=(f"Downloading {file_info['file_name']}", message, time.time())
-            )
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception as e:
-            logger.error(f"Download attempt {attempt + 1} failed: {e}")
-            if attempt == max_retries - 1:
-                await message.reply_text(f"❌ Failed to download after {max_retries} attempts")
-                return None
-            await asyncio.sleep(2 ** attempt)
-    
-    return None
-
-async def get_thumbnail_path(client: Client, message: Message) -> Optional[str]:
-    """Extract thumbnail from message"""
-    try:
-        if message.video and message.video.thumbs:
-            thumb_path = await client.download_media(message.video.thumbs[0].file_id)
-            with Image.open(thumb_path) as img:
-                img.thumbnail((320, 320))
-                img.save(thumb_path, "JPEG")
-            return thumb_path
-        return None
-    except Exception as e:
-        logger.error(f"Thumbnail error: {e}")
-        return None
-
-async def send_file_to_user(client: Client, message: Message, file_path: str, cleaned_name: str):
-    """Send processed file back to user"""
-    try:
-        if file_path.endswith(('.mp4', '.mkv', '.avi')):
-            await client.send_video(
-                chat_id=message.chat.id,
-                video=file_path,
-                caption=f"✅ {cleaned_name}",
-                supports_streaming=True
-            )
-        elif file_path.endswith(('.mp3', '.flac')):
-            await client.send_audio(
-                chat_id=message.chat.id,
-                audio=file_path,
-                caption=f"✅ {cleaned_name}"
-            )
-        else:
-            await client.send_document(
-                chat_id=message.chat.id,
-                document=file_path,
-                caption=f"✅ {cleaned_name}"
-            )
-    except Exception as e:
-        logger.error(f"Error sending file to user: {e}")
-        await message.reply_text(f"❌ Failed to send file: {str(e)[:200]}")
-
-
+    msg = await message.reply_text("**Sequence has been started! Send your files...**")
+    sequence_message_ids[user_id].append(msg.id)
 @Client.on_message(filters.command(["dedupe", "removedupes"]))
 async def remove_duplicates(client: Client, message: Message):
     """Remove duplicate files in a sequence"""
@@ -706,161 +508,6 @@ async def remove_duplicates(client: Client, message: Message):
         f"✅ Removed {duplicates} duplicate files\n"
         f"Unique files remaining: {len(unique_files)}"
     )
-
-@Client.on_message(filters.command(["cr", "channelrename"]))
-async def channel_rename_handler(client: Client, message: Message):
-    """Handle direct channel file renaming via message links"""
-    user_id = message.from_user.id
-    
-    if len(message.command) < 2:
-        return await message.reply_text(
-            "❌ Usage:\n"
-            "/cr <message_link>\n"
-            "/cr <start_msg_id>-<end_msg_id> (for batch)\n\n"
-            "Example:\n"
-            "/cr https://t.me/c/2303393084/368\n"
-            "/cr https://t.me/c/2303393084/368-400"
-        )
-    
-    try:
-        # Parse message link or range
-        if message.command[1].startswith("http"):
-            # Single message link
-            msg_ids = [await parse_message_link(client, message.command[1])]
-            if not msg_ids[0]:
-                return await message.reply_text("❌ Invalid message link!")
-        else:
-            # ID range (e.g., 368-400)
-            if "-" not in message.command[1]:
-                return await message.reply_text("❌ Invalid range format!")
-            
-            start_id, end_id = map(int, message.command[1].split("-"))
-            msg_ids = list(range(start_id, end_id + 1))
-        
-        # Check user points
-        rename_cost = settings.RENAME_COST
-        user_points = await hyoshcoder.get_points(user_id)
-        total_cost = len(msg_ids) * rename_cost
-        
-        if user_points < total_cost:
-            return await message.reply_text(
-                f"❌ Need {total_cost} points (have {user_points})",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("Get Points", callback_data="freepoints")]
-                ])
-            )
-        
-        # Start processing
-        processing_msg = await message.reply_text(
-            f"🔄 Processing {len(msg_ids)} files from channel..."
-        )
-        
-        success_count = 0
-        failed_count = 0
-        
-        for msg_id in msg_ids:
-            try:
-                # Get the message from channel
-                msg = await client.get_messages(
-                    chat_id=message.chat.id,
-                    message_ids=msg_id
-                )
-                
-                if not msg or not (msg.document or msg.video or msg.audio):
-                    failed_count += 1
-                    continue
-                
-                # Process like normal file
-                file_info = {
-                    'message': msg,
-                    'file_id': msg.document.file_id if msg.document else msg.video.file_id if msg.video else msg.audio.file_id,
-                    'file_name': msg.document.file_name if msg.document else msg.video.file_name if msg.video else msg.audio.file_name,
-                    'size': msg.document.file_size if msg.document else msg.video.file_size if msg.video else msg.audio.file_size,
-                    'media_type': 'document' if msg.document else 'video' if msg.video else 'audio'
-                }
-                
-                user_data = await hyoshcoder.read_user(user_id)
-                if await process_file_with_features(client, msg, file_info, user_data):
-                    success_count += 1
-                else:
-                    failed_count += 1
-                
-            except Exception as e:
-                logger.error(f"Error processing channel message {msg_id}: {e}")
-                failed_count += 1
-        
-        # Final report
-        await processing_msg.edit_text(
-            f"✅ Channel Rename Complete\n\n"
-            f"• Success: {success_count}\n"
-            f"• Failed: {failed_count}\n"
-            f"• Points used: {success_count * rename_cost}"
-        )
-        
-    except Exception as e:
-        logger.error(f"Channel rename error: {e}")
-        await message.reply_text(f"❌ Error: {str(e)[:200]}")
-
-async def process_batch_with_features(client: Client, user_id: int):
-    """Process batch with all features integrated"""
-    if user_id not in user_file_queues or not user_file_queues[user_id].get('queue'):
-        return
-    
-    batch_data = user_file_queues[user_id].get('batch_data', {})
-    start_time = batch_data.get("start_time", time.time())
-    
-    success_count = 0
-    failed_count = 0
-    
-    while user_file_queues[user_id]['queue']:
-        file_info = user_file_queues[user_id]['queue'].pop(0)
-        
-        try:
-            user_data = await hyoshcoder.read_user(user_id)
-            if await process_file_with_features(client, file_info['message'], file_info, user_data):
-                success_count += 1
-                batch_data["points_used"] = batch_data.get("points_used", 0) + settings.RENAME_COST
-            else:
-                failed_count += 1
-                
-        except Exception as e:
-            logger.error(f"Batch processing error: {e}")
-            failed_count += 1
-    
-    # Final report
-    time_taken = time.time() - start_time
-    mins, secs = divmod(int(time_taken), 60)
-    
-    await client.send_message(
-        user_id,
-        f"🎉 Batch Processing Complete\n\n"
-        f"• Success: {success_count}\n"
-        f"• Failed: {failed_count}\n"
-        f"• Time: {mins}m {secs}s\n"
-        f"• Points used: {batch_data.get('points_used', 0)}"
-    )
-    
-    # Cleanup
-    user_file_queues[user_id]['batch_data'] = None
-
-# SEQUENCE HANDLERS
-@Client.on_message(filters.command(["ssequence", "startsequence"]))
-async def start_sequence(client: Client, message: Message):
-    """Start a file sequence collection"""
-    user_id = message.from_user.id
-    
-    if settings.ADMIN_MODE and user_id not in settings.ADMINS:
-        return await message.reply_text("**Admin mode is active - Only admins can use sequences!**")
-        
-    if user_id in active_sequences:
-        return await message.reply_text("**A sequence is already active! Use /esequence to end it.**")
-    
-    active_sequences[user_id] = []
-    sequence_message_ids[user_id] = []
-    
-    msg = await message.reply_text("**Sequence has been started! Send your files...**")
-    sequence_message_ids[user_id].append(msg.id)
-    
 @Client.on_message(filters.command(["esequence", "endsequence"]))
 async def end_sequence(client: Client, message: Message):
     """End a file sequence and send sorted files"""
@@ -1018,7 +665,16 @@ async def auto_rename_files(client: Client, message: Message):
     
     # Initialize global variables if not exists
     global user_file_queues, user_semaphores, renaming_operations, file_processing_counters
-    
+    if getattr(message, 'media_group_id', None):
+        if not user_file_queues[user_id]['batch_data']:
+            user_file_queues[user_id]['batch_data'] = {
+                "start_time": start_time,
+                "count": 0,
+                "points_used": 0,
+                "is_batch": True  # Explicit batch flag
+            }
+        user_file_queues[user_id]['batch_data']["count"] += 1
+        
     if 'file_processing_counters' not in globals():
         file_processing_counters = {}
     
@@ -1117,11 +773,11 @@ async def auto_rename_files(client: Client, message: Message):
         asyncio.create_task(process_user_queue(client, user_id))
 
 async def process_user_queue(client: Client, user_id: int):
-    """Process all files in the user's queue with semaphore control"""
+    """Process all files in the user's queue with enhanced batch detection"""
     # Initialize semaphore for this user if not exists
     if user_id not in user_semaphores:
-        user_semaphores[user_id] = asyncio.Semaphore(2)  # Allow 2 concurrent processes
-    
+        user_semaphores[user_id] = asyncio.Semaphore(3)  # Increased concurrency
+        
     while user_file_queues.get(user_id, {}).get('queue'):
         async with user_semaphores[user_id]:
             file_info = user_file_queues[user_id]['queue'].pop(0)
@@ -1132,25 +788,14 @@ async def process_user_queue(client: Client, user_id: int):
                     await file_info['message'].reply_text("❌ Unable to load your information. Please type /start to register.")
                     continue
 
-                # Check sequential mode from database
-                sequential_mode = user_data.get("sequential_mode", False)
+                # Check if this is part of a batch
+                is_batch = bool(user_file_queues[user_id].get('batch_data'))
                 
-                # Handle sequential mode
-                if sequential_mode:
-                    if user_id not in sequential_operations:
-                        sequential_operations[user_id] = {"files": [], "expected_count": 0}
-
-                    sequential_operations[user_id]["expected_count"] += 1
-                    while len(sequential_operations[user_id]["files"]) > 0:
-                        await asyncio.sleep(1)
-                        if user_id in cancel_operations and cancel_operations[user_id]:
-                            await file_info['message'].reply_text("❌ Processing canceled by user")
-                            break
-
-                await process_single_file(client, file_info, user_data)
+                # Process the file
+                await process_single_file(client, file_info, user_data, is_batch)
                 
                 # Handle batch completion if this was the last file in a batch
-                if (user_file_queues[user_id]['batch_data'] and 
+                if (is_batch and 
                     len(user_file_queues[user_id]['queue']) == 0):
                     batch_data = user_file_queues[user_id]['batch_data']
                     await send_completion_message(
@@ -1175,7 +820,7 @@ async def process_user_queue(client: Client, user_id: int):
         if len(user_file_queues[user_id]['queue']) == 0:
             del user_file_queues[user_id]
 
-async def process_single_file(client: Client, file_info: dict, user_data: dict):
+async def process_single_file(client: Client, file_info: dict, user_data: dict, is_batch: bool = False):
     """Process a single file with all the renaming logic"""
     message = file_info['message']
     user_id = message.from_user.id
@@ -1480,12 +1125,17 @@ async def process_single_file(client: Client, file_info: dict, user_data: dict):
             if user_file_queues.get(user_id, {}).get('batch_data'):
                 user_file_queues[user_id]['batch_data']["points_used"] += rename_cost
     
-            # Send success message for single files
-            if not user_file_queues.get(user_id, {}).get('batch_data'):
-                await send_single_success_message(
-                    client, message, file_info['file_name'], renamed_file_name,
-                    start_time, rename_cost, metadata_added
-                )
+            # Send appropriate success message
+            await send_success_message(
+                client,
+                message,
+                file_info,
+                renamed_file_name,
+                start_time,
+                rename_cost,
+                metadata_added,
+                is_batch=is_batch
+            )
     
             break  # Success - exit retry loop
     
@@ -1674,6 +1324,7 @@ async def show_leaderboard(client: Client, message: Message):
         except:
             pass
         await message.reply_text("❌ Failed to load leaderboard. Please try again later.")
+# SCREENSHOT GENERATOR (MAX 4K)
 
 async def generate_screenshots(video_path: str, output_dir: str, count: int = 10) -> List[str]:
     """Generate screenshots at the video's native resolution using ffmpeg."""
