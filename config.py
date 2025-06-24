@@ -36,7 +36,7 @@ class Settings():
     # Liste des canaux pour le force subscribe (séparés par une virgule)
     FORCE_SUB_CHANNELS = os.getenv('FORCE_SUB_CHANNELS', ' ').split(',')
     ADMIN_MODE = False
-
+    RENAME_COST = 2
         
     # Récupération et conversion sécurisée des IDs de chat
     def safe_int(var_name, default=None):
