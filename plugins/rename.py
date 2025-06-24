@@ -1,39 +1,29 @@
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, MessageNotModified, BadRequest
-from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from PIL import Image
 from datetime import datetime, timedelta
 import os
 import time
 import re
 import pytz
-
 import asyncio
 import random
 import shutil
-from pyrogram.types import InputMediaPhoto
 import uuid
 import logging
 from pyrogram.enums import ParseMode, ChatAction
 import json
-from typing import Optional, Tuple, Dict, List, Set
+from typing import Optional, Tuple, Dict, List, Set, Union
+from urllib.parse import urlparse
+from difflib import SequenceMatcher
+from html import escape as html_escape
+
 # Database imports
 from database.data import hyoshcoder
 from config import settings
 from helpers.utils import progress_for_pyrogram, humanbytes, convert, extract_episode, extract_quality, extract_season
-from pyrogram.errors import MessageNotModified, BadRequest
-import html
-from html import escape as html_escape
 
-def escape_markdown(text: str) -> str:
-    """Custom Markdown escaper for Telegram"""
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
-
-def escape_html(text: str) -> str:
-    """Escape text for HTML parse mode"""
-    return html_escape(text, quote=False)
-    
 logger = logging.getLogger(__name__)
 
 # Global variables to manage operations
@@ -43,12 +33,19 @@ renaming_operations = {}  # Tracks currently processing files
 user_batch_trackers = {}  # Track batch operations per user
 sequential_operations = {}  # For sequential mode
 active_sequences = {}  # For sequence handling
+sequence_message_ids = {}  # Track sequence messages
 cancel_operations = {}  # Track cancel requests
 processed_files = set()  # Track processed files to prevent duplicate point deductions
+file_processing_counters = {}  # Track file processing counts
 
-# Sequence handling variables
-active_sequences: Dict[int, List[Dict[str, str]]] = {}
-sequence_message_ids: Dict[int, List[int]] = {}
+def escape_markdown(text: str) -> str:
+    """Custom Markdown escaper for Telegram"""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
+
+def escape_html(text: str) -> str:
+    """Escape text for HTML parse mode"""
+    return html_escape(text, quote=False)
 
 def sanitize_metadata(metadata_text: str) -> str:
     """Sanitize metadata text to be FFmpeg-safe"""
@@ -474,21 +471,555 @@ async def send_single_success_message(client: Client, message: Message, file_nam
         logger.error(f"Error sending success message: {e}")
         await message.reply_text("✅ File processed successfully!")
 
-@Client.on_message(filters.command("cancel"))
-async def cancel_processing(client: Client, message: Message):
-    """Cancel current processing operations"""
+async def apply_cleaning_rules(user_id: int, filename: str) -> str:
+    """Apply all cleaning rules to a filename"""
+    user_data = await hyoshcoder.users.find_one(
+        {"_id": user_id},
+        {"replace_rules": 1, "settings.auto_rename": 1}
+    )
+    
+    cleaned = filename
+    
+    # Apply replacement/removal rules
+    if user_data and "replace_rules" in user_data:
+        for rule in user_data["replace_rules"]:
+            if "new" in rule:  # Replacement
+                cleaned = cleaned.replace(rule["old"], rule["new"])
+            else:  # Removal
+                cleaned = cleaned.replace(rule["old"], "")
+    
+    # Apply auto-rename if enabled
+    if user_data.get("settings", {}).get("auto_rename", False):
+        cleaned = await generate_auto_name(cleaned)
+    
+    # Final cleanup
+    cleaned = re.sub(r'[\._]+', ' ', cleaned)  # Convert separators to spaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()  # Remove extra spaces
+    
+    return cleaned
+
+async def generate_auto_name(filename: str) -> str:
+    """Generate automatic name based on filename patterns"""
+    try:
+        # Extract season and episode
+        season = await extract_season(filename)
+        episode = await extract_episode(filename)
+        quality = await extract_quality(filename)
+        
+        # Build new name
+        parts = []
+        if season:
+            parts.append(f"S{season.zfill(2)}")
+        if episode:
+            parts.append(f"E{episode.zfill(2)}")
+        if quality:
+            parts.append(quality)
+            
+        if parts:
+            return " ".join(parts)
+        return filename
+    except Exception as e:
+        logger.error(f"Error in auto name generation: {e}")
+        return filename
+
+async def parse_message_link(client: Client, link: str) -> Optional[int]:
+    """Extract message ID from Telegram message link"""
+    try:
+        parsed = urlparse(link)
+        if not parsed.path:
+            return None
+        
+        path_parts = parsed.path.strip("/").split("/")
+        if len(path_parts) < 2:
+            return None
+        
+        # Handle both public and private links
+        if path_parts[0] == "c":
+            # Private channel link (e.g., /c/12345/678)
+            if not path_parts[1].isdigit():
+                return None
+            return int(path_parts[2]) if len(path_parts) > 2 and path_parts[2].isdigit() else None
+        else:
+            # Public link (e.g., /username/12345)
+            return int(path_parts[1]) if path_parts[1].isdigit() else None
+    except Exception as e:
+        logger.error(f"Link parsing error: {e}")
+        return None
+
+async def get_file_hash(client: Client, file_info: dict) -> str:
+    """Generate unique hash for file detection"""
+    try:
+        # For files we have access to
+        if "file_id" in file_info:
+            file = await client.download_media(file_info["file_id"], in_memory=True)
+            return str(hash(file.getbuffer()))
+        
+        # Fallback to name + size
+        return str(hash((file_info.get("file_name", ""), file_info.get("size", 0))))
+    except Exception as e:
+        logger.error(f"Hash generation error: {e}")
+        return str(hash((file_info.get("file_name", ""), file_info.get("size", 0))))
+
+async def process_file_with_features(
+    client: Client,
+    message: Message,
+    file_info: dict,
+    user_data: dict
+) -> bool:
+    """Enhanced file processor with all features"""
     user_id = message.from_user.id
-    cancel_operations[user_id] = True
     
-    # Clean up any ongoing operations
-    if user_id in user_batch_trackers:
-        del user_batch_trackers[user_id]
-    if user_id in file_processing_counters:
-        del file_processing_counters[user_id]
-    if user_id in sequential_operations:
-        sequential_operations[user_id]["files"] = []
+    # 1. Apply cleaning rules
+    original_name = file_info["file_name"]
+    cleaned_name = await apply_cleaning_rules(user_id, original_name)
     
-    await message.reply_text("🛑 Cancel request received. Current operations will be stopped after completing current file.")
+    # 2. Download file (with retry logic)
+    file_path = await download_file_with_retry(client, message, file_info)
+    if not file_path:
+        return False
+    
+    # 3. Add metadata if enabled
+    metadata_added = False
+    if user_data.get("metadata_enabled", False):
+        metadata_text = user_data.get("metadata_template", "")
+        if metadata_text:
+            metadata_path = f"{file_path}_meta"
+            success, _ = await add_comprehensive_metadata(file_path, metadata_path, metadata_text)
+            if success:
+                file_path = metadata_path
+                metadata_added = True
+    
+    # 4. Handle dump channel
+    dump_success = False
+    dump_channel = await hyoshcoder.get_user_channel(user_id)
+    if dump_channel:
+        dump_success = await send_to_dump_channel(
+            client,
+            user_id,
+            file_path,
+            caption=f"From channel rename: {cleaned_name}",
+            thumb_path=await get_thumbnail_path(client, message)
+        )
+    
+    # 5. Send to user if dump failed or not configured
+    if not dump_success:
+        await send_file_to_user(client, message, file_path, cleaned_name)
+    
+    # 6. Track operation
+    rename_cost = settings.RENAME_COST
+    await track_rename_operation(user_id, original_name, cleaned_name, rename_cost)
+    
+    # 7. Cleanup
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    
+    return True
+
+async def download_file_with_retry(client: Client, message: Message, file_info: dict, max_retries=3) -> Optional[str]:
+    """Download file with retry logic"""
+    temp_path = f"temp_{file_info['file_id']}"
+    
+    for attempt in range(max_retries):
+        try:
+            return await client.download_media(
+                message,
+                file_name=temp_path,
+                progress=progress_for_pyrogram,
+                progress_args=(f"Downloading {file_info['file_name']}", message, time.time())
+            )
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except Exception as e:
+            logger.error(f"Download attempt {attempt + 1} failed: {e}")
+            if attempt == max_retries - 1:
+                await message.reply_text(f"❌ Failed to download after {max_retries} attempts")
+                return None
+            await asyncio.sleep(2 ** attempt)
+    
+    return None
+
+async def get_thumbnail_path(client: Client, message: Message) -> Optional[str]:
+    """Extract thumbnail from message"""
+    try:
+        if message.video and message.video.thumbs:
+            thumb_path = await client.download_media(message.video.thumbs[0].file_id)
+            with Image.open(thumb_path) as img:
+                img.thumbnail((320, 320))
+                img.save(thumb_path, "JPEG")
+            return thumb_path
+        return None
+    except Exception as e:
+        logger.error(f"Thumbnail error: {e}")
+        return None
+
+async def send_file_to_user(client: Client, message: Message, file_path: str, cleaned_name: str):
+    """Send processed file back to user"""
+    try:
+        if file_path.endswith(('.mp4', '.mkv', '.avi')):
+            await client.send_video(
+                chat_id=message.chat.id,
+                video=file_path,
+                caption=f"✅ {cleaned_name}",
+                supports_streaming=True
+            )
+        elif file_path.endswith(('.mp3', '.flac')):
+            await client.send_audio(
+                chat_id=message.chat.id,
+                audio=file_path,
+                caption=f"✅ {cleaned_name}"
+            )
+        else:
+            await client.send_document(
+                chat_id=message.chat.id,
+                document=file_path,
+                caption=f"✅ {cleaned_name}"
+            )
+    except Exception as e:
+        logger.error(f"Error sending file to user: {e}")
+        await message.reply_text(f"❌ Failed to send file: {str(e)[:200]}")
+
+@Client.on_message(filters.command(["setmedia", "setmediatype"]))
+async def set_media_type(client: Client, message: Message):
+    """Set preferred media type for uploads"""
+    user_id = message.from_user.id
+    args = message.text.split()
+    
+    if len(args) < 2:
+        return await message.reply_text(
+            "❌ Usage: /setmedia <type>\n"
+            "Available types: video, document, audio"
+        )
+    
+    media_type = args[1].lower()
+    if media_type not in ["video", "document", "audio"]:
+        return await message.reply_text("Invalid media type! Use video/document/audio")
+    
+    await hyoshcoder.users.update_one(
+        {"_id": user_id},
+        {"$set": {"media_preference": media_type}},
+        upsert=True
+    )
+    await message.reply_text(f"✅ Media type set to: {media_type}")
+
+@Client.on_message(filters.command(["autorename", "auto_rename"]))
+async def toggle_auto_rename(client: Client, message: Message):
+    """Toggle auto-rename feature on/off"""
+    user_id = message.from_user.id
+    current = await hyoshcoder.users.find_one(
+        {"_id": user_id},
+        {"settings.auto_rename": 1}
+    )
+    
+    new_setting = not current.get("settings", {}).get("auto_rename", False) if current else True
+    
+    await hyoshcoder.users.update_one(
+        {"_id": user_id},
+        {"$set": {"settings.auto_rename": new_setting}},
+        upsert=True
+    )
+    
+    await message.reply_text(f"🔄 Auto-rename {'enabled' if new_setting else 'disabled'}!")
+
+@Client.on_message(filters.command(["replace", "remove"]))
+async def handle_replace_remove(client: Client, message: Message):
+    """Handle word replacement/removal in filenames"""
+    user_id = message.from_user.id
+    args = message.text.split(maxsplit=2)
+    
+    if len(args) < 2:
+        return await message.reply_text(
+            "❌ Usage:\n"
+            "/replace <old> <new>\n"
+            "/remove <text_to_remove>"
+        )
+    
+    command = args[0].lower()
+    old_text = args[1]
+    new_text = args[2] if command == "/replace" and len(args) > 2 else ""
+    
+    # Store rule
+    rule = {"old": old_text, "new": new_text} if command == "/replace" else {"old": old_text}
+    
+    await hyoshcoder.users.update_one(
+        {"_id": user_id},
+        {"$addToSet": {"replace_rules": rule}},
+        upsert=True
+    )
+    
+    action = "Replacement" if command == "/replace" else "Removal"
+    await message.reply_text(
+        f"✅ {action} rule added:\n"
+        f"`{old_text}` → `{new_text if command == '/replace' else '[REMOVED]'}`"
+    )
+
+@Client.on_message(filters.command(["listrules", "lr"]))
+async def list_rules(client: Client, message: Message):
+    """List all replacement/removal rules"""
+    user_id = message.from_user.id
+    user_data = await hyoshcoder.users.find_one(
+        {"_id": user_id},
+        {"replace_rules": 1}
+    )
+    
+    if not user_data or not user_data.get("replace_rules"):
+        return await message.reply_text("No rules set yet!")
+    
+    rules_text = "📜 Your Replacement/Removal Rules:\n\n"
+    for idx, rule in enumerate(user_data["replace_rules"], 1):
+        rules_text += (
+            f"{idx}. {'Replace' if 'new' in rule else 'Remove'}:\n"
+            f"   `{rule['old']}` → "
+            f"`{rule.get('new', '[REMOVED]')}`\n"
+        )
+    
+    await message.reply_text(rules_text)
+
+@Client.on_message(filters.command(["clearrules", "cr"]))
+async def clear_rules(client: Client, message: Message):
+    """Clear all or specific replacement rules"""
+    user_id = message.from_user.id
+    args = message.text.split()
+    
+    if len(args) > 1 and args[1].lower() == "all":
+        await hyoshcoder.users.update_one(
+            {"_id": user_id},
+            {"$set": {"replace_rules": []}}
+        )
+        return await message.reply_text("✅ All rules cleared!")
+    
+    await message.reply_text(
+        "To clear specific rules, use:\n"
+        "/clearrules <rule_number>\n"
+        "See rule numbers with /listrules"
+    )
+
+@Client.on_message(filters.command(["clean", "preview"]))
+async def preview_clean(client: Client, message: Message):
+    """Preview filename after cleaning"""
+    user_id = message.from_user.id
+    
+    if not message.reply_to_message or not (
+        message.reply_to_message.document or 
+        message.reply_to_message.video or
+        message.reply_to_message.audio
+    ):
+        return await message.reply_text("Reply to a media file to preview cleaning")
+    
+    media = (
+        message.reply_to_message.document or 
+        message.reply_to_message.video or
+        message.reply_to_message.audio
+    )
+    original_name = media.file_name
+    
+    # Apply cleaning
+    cleaned_name = await apply_cleaning_rules(user_id, original_name)
+    
+    await message.reply_text(
+        "🧹 Filename Cleaning Preview:\n\n"
+        f"Original: `{original_name}`\n"
+        f"Cleaned: `{cleaned_name}`"
+    )
+
+@Client.on_message(filters.command(["bulkclean", "bc"]))
+async def bulk_clean(client: Client, message: Message):
+    """Bulk clean filenames from a text file"""
+    user_id = message.from_user.id
+    
+    if not message.reply_to_message or not message.reply_to_message.document:
+        return await message.reply_text("Reply to a text file containing filenames")
+    
+    if not message.reply_to_message.document.file_name.endswith(".txt"):
+        return await message.reply_text("Please upload a .txt file")
+    
+    # Download the text file
+    txt_path = await message.reply_to_message.download()
+    
+    # Read and process all filenames
+    with open(txt_path, "r") as f:
+        filenames = [line.strip() for line in f if line.strip()]
+    
+    cleaned_names = []
+    for filename in filenames:
+        cleaned = await apply_cleaning_rules(user_id, filename)
+        cleaned_names.append(f"{filename} → {cleaned}")
+    
+    # Save results
+    result_path = f"cleaned_{user_id}.txt"
+    with open(result_path, "w") as f:
+        f.write("\n".join(cleaned_names))
+    
+    # Send back results
+    await message.reply_document(
+        result_path,
+        caption=f"✅ Cleaned {len(cleaned_names)} filenames"
+    )
+    
+    # Cleanup
+    os.remove(txt_path)
+    os.remove(result_path)
+
+@Client.on_message(filters.command(["dedupe", "removedupes"]))
+async def remove_duplicates(client: Client, message: Message):
+    """Remove duplicate files in a sequence"""
+    user_id = message.from_user.id
+    
+    if user_id not in active_sequences or not active_sequences[user_id]:
+        return await message.reply_text("No active sequence! Use /ssequence first")
+    
+    files = active_sequences[user_id]
+    unique_files = []
+    seen_hashes = set()
+    
+    for file in files:
+        file_hash = hash((file["file_name"], file["size"]))
+        if file_hash not in seen_hashes:
+            seen_hashes.add(file_hash)
+            unique_files.append(file)
+    
+    duplicates = len(files) - len(unique_files)
+    active_sequences[user_id] = unique_files
+    
+    await message.reply_text(
+        f"✅ Removed {duplicates} duplicate files\n"
+        f"Unique files remaining: {len(unique_files)}"
+    )
+
+@Client.on_message(filters.command(["cr", "channelrename"]))
+async def channel_rename_handler(client: Client, message: Message):
+    """Handle direct channel file renaming via message links"""
+    user_id = message.from_user.id
+    
+    if len(message.command) < 2:
+        return await message.reply_text(
+            "❌ Usage:\n"
+            "/cr <message_link>\n"
+            "/cr <start_msg_id>-<end_msg_id> (for batch)\n\n"
+            "Example:\n"
+            "/cr https://t.me/c/2303393084/368\n"
+            "/cr https://t.me/c/2303393084/368-400"
+        )
+    
+    try:
+        # Parse message link or range
+        if message.command[1].startswith("http"):
+            # Single message link
+            msg_ids = [await parse_message_link(client, message.command[1])]
+            if not msg_ids[0]:
+                return await message.reply_text("❌ Invalid message link!")
+        else:
+            # ID range (e.g., 368-400)
+            if "-" not in message.command[1]:
+                return await message.reply_text("❌ Invalid range format!")
+            
+            start_id, end_id = map(int, message.command[1].split("-"))
+            msg_ids = list(range(start_id, end_id + 1))
+        
+        # Check user points
+        rename_cost = settings.RENAME_COST
+        user_points = await hyoshcoder.get_points(user_id)
+        total_cost = len(msg_ids) * rename_cost
+        
+        if user_points < total_cost:
+            return await message.reply_text(
+                f"❌ Need {total_cost} points (have {user_points})",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Get Points", callback_data="freepoints")]
+                ])
+            )
+        
+        # Start processing
+        processing_msg = await message.reply_text(
+            f"🔄 Processing {len(msg_ids)} files from channel..."
+        )
+        
+        success_count = 0
+        failed_count = 0
+        
+        for msg_id in msg_ids:
+            try:
+                # Get the message from channel
+                msg = await client.get_messages(
+                    chat_id=message.chat.id,
+                    message_ids=msg_id
+                )
+                
+                if not msg or not (msg.document or msg.video or msg.audio):
+                    failed_count += 1
+                    continue
+                
+                # Process like normal file
+                file_info = {
+                    'message': msg,
+                    'file_id': msg.document.file_id if msg.document else msg.video.file_id if msg.video else msg.audio.file_id,
+                    'file_name': msg.document.file_name if msg.document else msg.video.file_name if msg.video else msg.audio.file_name,
+                    'size': msg.document.file_size if msg.document else msg.video.file_size if msg.video else msg.audio.file_size,
+                    'media_type': 'document' if msg.document else 'video' if msg.video else 'audio'
+                }
+                
+                user_data = await hyoshcoder.read_user(user_id)
+                if await process_file_with_features(client, msg, file_info, user_data):
+                    success_count += 1
+                else:
+                    failed_count += 1
+                
+            except Exception as e:
+                logger.error(f"Error processing channel message {msg_id}: {e}")
+                failed_count += 1
+        
+        # Final report
+        await processing_msg.edit_text(
+            f"✅ Channel Rename Complete\n\n"
+            f"• Success: {success_count}\n"
+            f"• Failed: {failed_count}\n"
+            f"• Points used: {success_count * rename_cost}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Channel rename error: {e}")
+        await message.reply_text(f"❌ Error: {str(e)[:200]}")
+
+async def process_batch_with_features(client: Client, user_id: int):
+    """Process batch with all features integrated"""
+    if user_id not in user_file_queues or not user_file_queues[user_id].get('queue'):
+        return
+    
+    batch_data = user_file_queues[user_id].get('batch_data', {})
+    start_time = batch_data.get("start_time", time.time())
+    
+    success_count = 0
+    failed_count = 0
+    
+    while user_file_queues[user_id]['queue']:
+        file_info = user_file_queues[user_id]['queue'].pop(0)
+        
+        try:
+            user_data = await hyoshcoder.read_user(user_id)
+            if await process_file_with_features(client, file_info['message'], file_info, user_data):
+                success_count += 1
+                batch_data["points_used"] = batch_data.get("points_used", 0) + settings.RENAME_COST
+            else:
+                failed_count += 1
+                
+        except Exception as e:
+            logger.error(f"Batch processing error: {e}")
+            failed_count += 1
+    
+    # Final report
+    time_taken = time.time() - start_time
+    mins, secs = divmod(int(time_taken), 60)
+    
+    await client.send_message(
+        user_id,
+        f"🎉 Batch Processing Complete\n\n"
+        f"• Success: {success_count}\n"
+        f"• Failed: {failed_count}\n"
+        f"• Time: {mins}m {secs}s\n"
+        f"• Points used: {batch_data.get('points_used', 0)}"
+    )
+    
+    # Cleanup
+    user_file_queues[user_id]['batch_data'] = None
 
 # SEQUENCE HANDLERS
 @Client.on_message(filters.command(["ssequence", "startsequence"]))
@@ -1321,7 +1852,6 @@ async def show_leaderboard(client: Client, message: Message):
         except:
             pass
         await message.reply_text("❌ Failed to load leaderboard. Please try again later.")
-# SCREENSHOT GENERATOR (MAX 4K)
 
 async def generate_screenshots(video_path: str, output_dir: str, count: int = 10) -> List[str]:
     """Generate screenshots at the video's native resolution using ffmpeg."""
