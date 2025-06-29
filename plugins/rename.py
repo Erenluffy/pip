@@ -411,7 +411,7 @@ async def get_user_rank(user_id: int, time_range: str = "all") -> Tuple[Optional
 
 async def send_success_message(client: Client, message: Message, file_info: dict, renamed_file_name: str, 
                              start_time: float, points_used: int, metadata_added: bool, is_batch: bool = False):
-    """Unified success message handler for both single and batch operations"""
+    """Unified success message handler that automatically detects batch vs single operations"""
     try:
         # Check if operation was canceled
         if message.from_user.id in cancel_operations and cancel_operations[message.from_user.id]:
@@ -423,7 +423,11 @@ async def send_success_message(client: Client, message: Message, file_info: dict
         
         remaining_points = (await hyoshcoder.get_points(message.from_user.id)) - points_used
         
-        if is_batch:
+        # Determine if this is part of a batch by checking queue length
+        user_queue = user_file_queues.get(message.from_user.id, {}).get('queue', [])
+        actual_is_batch = len(user_queue) > 1 or is_batch
+        
+        if actual_is_batch:
             # Batch success message
             success_msg = (
                 f"✅ 𝗕𝗮𝘁𝗰𝗵 𝗥𝗲𝗻𝗮𝗺𝗲 𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲𝗱\n\n"
@@ -788,8 +792,8 @@ async def process_user_queue(client: Client, user_id: int):
                     await file_info['message'].reply_text("❌ Unable to load your information. Please type /start to register.")
                     continue
 
-                # Check if this is part of a batch
-                is_batch = bool(user_file_queues[user_id].get('batch_data'))
+                # Determine if this is part of a batch by checking remaining queue
+                is_batch = len(user_file_queues[user_id]['queue']) > 0
                 
                 # Process the file
                 await process_single_file(client, file_info, user_data, is_batch)
@@ -797,13 +801,13 @@ async def process_user_queue(client: Client, user_id: int):
                 # Handle batch completion if this was the last file in a batch
                 if (is_batch and 
                     len(user_file_queues[user_id]['queue']) == 0):
-                    batch_data = user_file_queues[user_id]['batch_data']
+                    batch_data = user_file_queues[user_id].get('batch_data', {})
                     await send_completion_message(
                         client,
                         user_id,
-                        batch_data["start_time"],
-                        batch_data["count"],
-                        batch_data["points_used"]
+                        batch_data.get("start_time", time.time()),
+                        batch_data.get("count", 0),
+                        batch_data.get("points_used", 0)
                     )
                     user_file_queues[user_id]['batch_data'] = None
                 
@@ -819,7 +823,6 @@ async def process_user_queue(client: Client, user_id: int):
         user_file_queues[user_id]['is_processing'] = False
         if len(user_file_queues[user_id]['queue']) == 0:
             del user_file_queues[user_id]
-
 async def process_single_file(client: Client, file_info: dict, user_data: dict, is_batch: bool = False):
     """Process a single file with all the renaming logic"""
     message = file_info['message']
